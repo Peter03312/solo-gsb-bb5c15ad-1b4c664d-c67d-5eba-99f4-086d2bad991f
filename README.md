@@ -77,6 +77,17 @@
   （报告为 `missing-version`）。成功时返回安全的 `resolved`、`dependency_graph`、
   `locks` 以及每条公告**实际排除的版本**与并集；无解返回 `conflict`，`max_attempts`
   触顶返回 `undetermined`（均为 409，触顶不视为无解），非法公告返回 `400`。
+- **升级可行性分析**：`POST /analyze/upgrade-feasibility` 沿用 `/resolve` 的包清单、
+  根需求、锁与求解选项，另接收一个目标包名与 **1～8 个候选版本**（按输入顺序比较）。
+  候选版本必须存在于该目标包的清单中，且按 PEP 440 规范化后不得重复（`1.0` 与
+  `1.0.0` 视为同一候选），否则整体返回 `400`。服务先在未修改的输入上求基线解
+  （保持锁优先），再对每个候选**临时追加**一条 `目标==候选版本` 的精确版本根约束做
+  一次**独立、完整的回溯求解**——原始根需求与其他锁全部继续参与，因此检查的是整个
+  依赖闭包而不是目标包自身的版本范围；一个候选冲突或触顶不影响其他候选。结果按候选
+  输入顺序返回 `ok` / `conflict` / `undetermined` 及各自的尝试次数：成功项给出完整
+  解析结果（`resolved` / `dependency_graph` / `locks`）与相对基线（原锁状态）解的
+  版本变更（新增 / 消失 / 改变）；冲突项给出结构化冲突摘要；触 `max_attempts` 报
+  `undetermined` 且**绝不判为不可安装**。
 
 ## 一条命令启动
 
@@ -86,7 +97,9 @@
 docker compose up --build
 ```
 
-服务监听 **http://localhost:8000**：
+服务监听 **http://localhost:8000**（容器内监听 `0.0.0.0:8000`；宿主机端口由
+`docker-compose.yml` 的 `ports` 映射决定，默认把宿主机 `8000` 映射到容器 `8000`，
+可按需修改）：
 
 - `GET /health` — 健康检查
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
@@ -99,6 +112,7 @@ docker compose up --build
 - `POST /plan/rebuild` — 为本地变更包生成确定性的重建计划
 - `POST /analyze/environment-matrix` — 在多个标记环境下独立解析并汇总版本矩阵
 - `POST /analyze/version-withdrawal` — 撤回一个包版本后整体重算并对比解析结果
+- `POST /analyze/upgrade-feasibility` — 对目标包的 1～8 个候选版本分别做全闭包可行性求解
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
 - `DELETE /jobs/{id}` — 取消作业
@@ -840,6 +854,124 @@ curl -s -X POST localhost:8000/analyze/version-withdrawal \
 版本为空返回 `422`，包或版本在清单中不存在（或版本不是合法 PEP 440）返回
 `400`。
 
+## 升级可行性分析 API
+
+`POST /analyze/upgrade-feasibility` 接收与 `/resolve` **完全相同的请求字段**
+（`packages`、`root`、`locks`、`allow_prereleases`、`marker_env`、`max_attempts`，
+校验规则完全一致），外加一个目标包 `target` 与 **1～8 个候选版本** `candidates`，
+回答：**把目标包钉到每个候选版本上时，整个依赖闭包还能否解析？**
+
+- 服务先在**未修改的输入**上求一次基线解（保持锁优先等全部 `/resolve` 语义），
+  作为各候选版本变更的比较基准。
+- 然后对 `candidates` 中的**每一个**版本做一次**独立、完整的回溯求解**：求解前
+  仅在该次求解的根需求中**临时追加**一条 `target==候选版本` 的精确版本约束；
+  **原始根需求与全部原始锁（包括目标包自身的锁）都继续参与**，因此可行性是对
+  完整依赖约束的判定，而不是只检查目标包自身是否落在某个版本范围内。一个候选
+  冲突或触顶不影响其他候选；各候选都有独立的完整 `max_attempts` 预算。
+- 候选必须存在于清单中该目标包的版本里，且按 PEP 440 规范化后不得重复
+  （`1.0` 与 `1.0.0` 是同一候选）；所有候选错误会在一次 `400` 中合并报告。
+- 追加的精确根钉与其他根需求一样会放开**目标包**的预发布过滤，因此
+  `allow_prereleases=false` 时候选 `2.0rc1` 仍可被求解。
+- 候选永远按**输入顺序**出现在响应中，回显使用清单自身的规范版本字符串；相同
+  输入永远得到相同输出。
+
+```bash
+curl -s -X POST localhost:8000/analyze/upgrade-feasibility \
+  -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "app": {"1.0": {"dependencies": {"web": ">=2.0", "db": ""}}},
+    "web": {"2.0": {"dependencies": {"common": "<2.0"}},
+            "3.0": {"dependencies": {"common": ">=2.0"}}},
+    "db":  {"1.0": {"dependencies": {"common": "==1.5"}}},
+    "common": {"1.5": {}, "2.0": {}}
+  },
+  "root": {"app": ""},
+  "locks": {"web": "2.0", "common": "1.5"},
+  "target": "web",
+  "candidates": ["2.0", "3.0"]
+}'
+```
+
+响应（HTTP **200**；一个候选可行、另一个与 `db` 的传递约束冲突；`dependency_graph`
+从略）：
+
+```json
+{
+  "target": {"package": "web", "candidates": ["2.0", "3.0"]},
+  "allow_prereleases": false,
+  "summary": {"candidates": 2, "ok": 1, "conflict": 1, "undetermined": 0},
+  "baseline": {
+    "status": "ok",
+    "attempts": 4,
+    "resolved": {"app": "1.0", "common": "1.5", "db": "1.0", "web": "2.0"},
+    "dependency_graph": [ "..." ],
+    "locks": {"common": "applied", "web": "applied"}
+  },
+  "candidates": [
+    {
+      "version": "2.0",
+      "status": "ok",
+      "attempts": 4,
+      "resolved": {"app": "1.0", "common": "1.5", "db": "1.0", "web": "2.0"},
+      "dependency_graph": [ "..." ],
+      "locks": {"common": "applied", "web": "applied"},
+      "changes": {"added": [], "removed": [], "changed": []}
+    },
+    {
+      "version": "3.0",
+      "status": "conflict",
+      "attempts": 3,
+      "locks": {"common": "unsatisfiable", "web": "unsatisfiable"},
+      "conflict": {
+        "terminal_conflicts": [
+          {
+            "package": "common",
+            "reason": "unsatisfiable",
+            "available_versions": ["2.0", "1.5"],
+            "active_constraints": [
+              {"requirement": "common==1.5", "required_by": "db", "...": "..."},
+              {"requirement": "common>=2.0", "required_by": "web", "...": "..."}
+            ]
+          }
+        ],
+        "tree": { "...": "完整的失败分支树..." }
+      }
+    }
+  ],
+  "attempts": 11
+}
+```
+
+响应字段：
+
+- `target`：规范化目标包名与按输入顺序回显的候选版本（清单自身规范拼写）。
+- `summary`：候选总数与三种状态的计数。
+- `baseline`：未修改输入的求解结果，形态与 `/resolve` 一致——`ok` 时带
+  `resolved` / `dependency_graph` / `locks`；`conflict` 时带结构化 `conflict`；
+  `limit` 时另带 `error.code = "search_limit_exceeded"`。
+- `candidates`：每个候选一项（**输入顺序**），含 `version`、`status`
+  （`ok` / `conflict` / `undetermined`）与该次独立求解实际求值的 `attempts`：
+  - **`ok`**：带完整的 `resolved` / `dependency_graph` / `locks`（与 `/resolve`
+    成功响应同形态）以及 `changes`——相对**基线（原锁状态）解**的差异，
+    `added`（新出现的包）、`removed`（消失的包）、`changed`（版本改变的包，含
+    `from` / `to`），均按规范包名稳定排序。基线求解触及 `max_attempts` 而没有
+    基线解时，候选仍可能快速收敛为 `ok`，此时 `changes` 为 `null`。
+  - **`conflict`**：带与 `/resolve` 冲突响应同形态的结构化 `conflict`
+    （可用版本、已尝试版本、每条矛盾约束的依赖路径）及该次求解的 `locks`；
+    没有 `resolved` / `changes`。
+  - **`undetermined`**：该候选的求解触及 `max_attempts`，带
+    `"error": {"code": "search_limit_exceeded", ...}` 与诊断性 `conflict`。
+    触顶**绝不判为不可安装**，可能只是预算不足。
+- `attempts`：基线求解与全部候选求解实际求值的候选次数之和。
+
+校验规则（非法输入返回 `400/422`，错误体与 `/resolve` 相同）：
+
+- `packages` / `root` / `locks` 的校验与 `/resolve` 完全复用；
+- `target` 缺失或为空、`candidates` 数量不在 1～8、含多余顶层字段等形状错误
+  返回 `422`；
+- `target` 不在清单中、候选版本不是合法 PEP 440、候选版本在清单中不存在，或
+  候选按 PEP 440 规范化后重复，均返回 `400`（`invalid_request`，多条错误合并）。
+
 ## 漏洞规避求解 API
 
 `POST /resolve/avoid-vulnerabilities` 接收与 `/resolve` **完全相同的请求字段**
@@ -943,7 +1075,10 @@ curl -s -X POST localhost:8000/resolve/avoid-vulnerabilities \
 （`/analyze/environment-matrix` 在此基础上把顶层 `marker_env` 换成 2～8 个各自
 携带 `marker_env` 的 `environments`，其余字段一致；`/analyze/version-withdrawal`
 则在与 `/resolve` 完全相同的字段之外增加一个 `withdraw: {"package", "version"}`
-目标；`/resolve/avoid-vulnerabilities` 在与 `/resolve` 完全相同的字段之外增加
+目标；`/analyze/upgrade-feasibility` 在与 `/resolve` 完全相同的字段之外增加
+`target`（目标包名字符串）与 `candidates`（1～8 个候选版本字符串数组，按输入
+顺序比较，候选必须存在于清单且 PEP 440 规范化后不重复）；
+`/resolve/avoid-vulnerabilities` 在与 `/resolve` 完全相同的字段之外增加
 `advisories: [{"id", "package", "affected"}]` 本地公告列表）：
 
 ```json
@@ -1093,6 +1228,7 @@ app/
   diagnose.py       # 根需求冲突诊断：逐条暂删+复算的最小冲突根集合（搜索触顶返回未确定）
   environment_matrix.py # 环境矩阵：多标记环境独立求解、成功环境版本矩阵与差异汇总
   version_withdrawal.py # 版本撤回分析：基线求解、移除单版本后整体重算、新增/消失/变更对比
+  upgrade_feasibility.py # 升级可行性：目标包 1～8 个候选各自临时精确根钉后独立完整回溯、基线版本变更对比、触顶不判无解
   avoid_vulnerabilities.py # 漏洞规避求解：公告命中版本取并集从清单副本排除、剩余候选完整回溯、逐公告实际排除版本
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
@@ -1100,8 +1236,8 @@ app/
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py           # FastAPI 应用与 /resolve、/resolve/avoid-vulnerabilities、/diagnose/root-conflict、/audit/*、/plan/rebuild、/analyze/environment-matrix、/analyze/version-withdrawal、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞审计/漏洞规避、关键节点、许可证审计、闭包指纹、重建计划、环境矩阵与版本撤回分析）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+  main.py           # FastAPI 应用与 /resolve、/resolve/avoid-vulnerabilities、/diagnose/root-conflict、/audit/*、/plan/rebuild、/analyze/environment-matrix、/analyze/version-withdrawal、/analyze/upgrade-feasibility、/jobs、/health
+tests/              # 端到端 API 测试（含漏洞审计/漏洞规避、关键节点、许可证审计、闭包指纹、重建计划、环境矩阵、版本撤回与升级可行性分析）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml
